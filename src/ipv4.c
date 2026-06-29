@@ -621,6 +621,11 @@ static int ipv4_run_route(struct rtentry *route, const char *action)
 	int j;
 	pid_t pid;
 	int ret;
+	int pipefd[2];
+	char output[4096];
+	ssize_t n;
+	size_t total = 0;
+	posix_spawn_file_actions_t actions;
 
 	if (access("/sbin/route", F_OK) != 0) {
 		log_error("/sbin/route: %s.\n", strerror(errno));
@@ -660,15 +665,41 @@ static int ipv4_run_route(struct rtentry *route, const char *action)
 			strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
 		strncat(cmd, args[j], sizeof(cmd) - strlen(cmd) - 1);
 	}
-	log_debug("%s\n", cmd);
+	log_debug("cmd: %s\n", cmd);
 
-	ret = posix_spawn(&pid, args[0], NULL, NULL, args, environ);
+	if (pipe(pipefd) == -1)
+		return ERR_IPV4_SEE_ERRNO;
+
+	// Capture both stdout and stderr
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+	ret = posix_spawn(&pid, args[0], &actions, NULL, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+
+	close(pipefd[1]);
+
 	if (ret != 0) {
+		close(pipefd[0]);
 		errno = ret;
 		return ERR_IPV4_SEE_ERRNO;
 	}
+
+	// Build a string out of the stdout and stderr previously captured
+	while (total < sizeof(output) - 1 &&
+	       (n = read(pipefd[0], output + total, sizeof(output) - 1 - total)) > 0)
+		total += n;
+	output[total] = '\0';
+	close(pipefd[0]);
+
 	if (waitpid(pid, NULL, 0) == -1)
 		return ERR_IPV4_SEE_ERRNO;
+
+	if (total > 0)
+		log_debug("%s", output);
 
 	return 0;
 }
